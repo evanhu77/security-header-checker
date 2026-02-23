@@ -2,45 +2,102 @@
 """
 Security Recon Tool
 -------------------
-Main entry point for the security header and cookie analysis suite.
-Runs both header_checker and cookie_checker against a target URL
-and produces a unified report.
+Main entry point for the security recon suite.
+Orchestrates header, cookie, subdomain, and attack inference modules.
+
+Modes:
+  Default         — headers + cookies for a single URL
+  --full-recon    — subdomain enum + headers + cookies + attack inference
+                    across the entire domain
 
 Usage:
   python main.py https://example.com
+  python main.py example.com --full-recon
   python main.py https://example.com --json report.json
   python main.py https://example.com --headers-only
   python main.py https://example.com --cookies-only
+  python main.py example.com --full-recon --json recon.json
   python main.py https://example.com --quiet
 """
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 
 from header_checker import fetch_headers, analyze_headers
 from cookie_checker import get_set_cookie_headers, analyze_cookies
+from subdomain_enum import enumerate as enumerate_subdomains, print_enum_report
+from attack_inference import infer, infer_bulk, print_inference_report, print_bulk_report
 
 
-# ─── Unified Report ───────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 SEVERITY_EMOJI = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪"}
 
 
+def extract_domain(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return urlparse(url).netloc.lower()
+
+
+def normalize_url(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        return "https://" + url
+    return url
+
+
+# ─── Single Target Scan ───────────────────────────────────────────────────────
+
+def scan_target(url: str, run_headers: bool = True, run_cookies: bool = True,
+                timeout: int = 10) -> dict:
+    url = normalize_url(url)
+    findings = {"url": url, "headers": None, "cookies": None,
+                "status_code": None, "final_url": url}
+
+    try:
+        if run_headers:
+            raw_headers, final_url, status_code = fetch_headers(url, timeout)
+            findings["headers"] = analyze_headers(raw_headers)
+            findings["final_url"] = final_url
+            findings["status_code"] = status_code
+
+        if run_cookies:
+            cookie_headers, final_url, status_code = get_set_cookie_headers(url, timeout)
+            findings["cookies"] = analyze_cookies(cookie_headers)
+            if not findings["final_url"]:
+                findings["final_url"] = final_url
+            if not findings["status_code"]:
+                findings["status_code"] = status_code
+
+    except requests.exceptions.ConnectionError:
+        findings["error"] = f"Could not connect to {url}"
+    except requests.exceptions.Timeout:
+        findings["error"] = f"Timeout after {timeout}s"
+    except Exception as e:
+        findings["error"] = str(e)
+
+    return findings
+
+
+# ─── Reporting: Single Target ─────────────────────────────────────────────────
+
 def print_header_section(findings: dict):
     if not findings:
         return
-
     score = findings["score"]
     print(f"\n  {'─'*54}")
-    print(f"  🔍 HEADERS  ·  Score: {score['score']}/100  Grade: {score['grade']}  ({score['label']})")
+    print(f"  🔍 HEADERS  ·  Score: {score['score']}/100  "
+          f"Grade: {score['grade']}  ({score['label']})")
     print(f"  {'─'*54}")
 
     if findings["missing"]:
-        print(f"\n  ❌ Missing ({len(findings['missing'])}):")
+        print(f"\n  ❌ Missing ({len(findings['missing'])}):\n")
         for h in findings["missing"]:
             emoji = SEVERITY_EMOJI.get(h["severity"], "⚪")
             print(f"     {emoji} [{h['severity']:6}]  {h['header']}")
@@ -49,14 +106,14 @@ def print_header_section(findings: dict):
             print()
 
     if findings["warnings"]:
-        print(f"  ⚠️  Misconfigured ({len(findings['warnings'])}):")
+        print(f"  ⚠️  Misconfigured ({len(findings['warnings'])}):\n")
         for h in findings["warnings"]:
-            print(f"     🟡 {h['header']}: {h['value']}")
+            print(f"     🟡 {h['header']}")
             print(f"              ↳ {h['warning']}")
             print()
 
     if findings["leaking"]:
-        print(f"  💧 Information Leakage ({len(findings['leaking'])}):")
+        print(f"  💧 Information Leakage ({len(findings['leaking'])}):\n")
         for h in findings["leaking"]:
             print(f"     ⚠️  {h['header']}: {h['value']}")
             print(f"              ↳ {h['description']}")
@@ -70,11 +127,10 @@ def print_header_section(findings: dict):
 def print_cookie_section(findings: dict):
     if not findings:
         return
-
     score = findings["score"]
     print(f"\n  {'─'*54}")
     print(f"  🍪 COOKIES  ·  Score: {score['score']}/100  Grade: {score['grade']}  "
-          f"·  {findings['total']} cookies found")
+          f"·  {findings['total']} found")
     print(f"  {'─'*54}")
 
     if findings["total"] == 0:
@@ -86,7 +142,6 @@ def print_cookie_section(findings: dict):
         risk = cookie["risk_level"]
         risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵", "SECURE": "✅"}.get(risk, "⚪")
         session_tag = " [SESSION]" if cookie["is_session_cookie"] else ""
-
         flags = cookie["flags"]
         honly = "✓ HttpOnly" if flags["httponly"] else "✗ HttpOnly"
         sec   = "✓ Secure"   if flags["secure"]   else "✗ Secure"
@@ -94,7 +149,6 @@ def print_cookie_section(findings: dict):
 
         print(f"\n     {risk_emoji} {cookie['name']}{session_tag}")
         print(f"        Flags: {honly}  {sec}  {ss}")
-
         for issue in cookie["issues"]:
             emoji = SEVERITY_EMOJI.get(issue["severity"], "⚪")
             print(f"        {emoji} [{issue['severity']:6}]  {issue['flag']} missing")
@@ -106,8 +160,10 @@ def print_cookie_section(findings: dict):
         print(f"\n  ⚠️  Attack vectors enabled: {', '.join(all_attacks)}")
 
 
-def print_unified_report(url: str, final_url: str, status_code: int,
-                          header_findings: dict, cookie_findings: dict):
+def print_single_report(scan: dict, show_inference: bool = True):
+    url = scan["url"]
+    final_url = scan.get("final_url", url)
+    status = scan.get("status_code", "?")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("\n" + "═" * 60)
@@ -116,16 +172,19 @@ def print_unified_report(url: str, final_url: str, status_code: int,
     print(f"  URL      : {url}")
     if final_url and final_url != url:
         print(f"  Resolved : {final_url}")
-    print(f"  Status   : {status_code}")
+    print(f"  Status   : {status}")
     print(f"  Scanned  : {timestamp}")
 
-    # Overall score — average of both modules when both are run
-    scores = []
-    if header_findings:
-        scores.append(header_findings["score"]["score"])
-    if cookie_findings:
-        scores.append(cookie_findings["score"]["score"])
+    if scan.get("error"):
+        print(f"\n  ❌ Error: {scan['error']}")
+        print("═" * 60)
+        return
 
+    scores = []
+    if scan.get("headers"):
+        scores.append(scan["headers"]["score"]["score"])
+    if scan.get("cookies"):
+        scores.append(scan["cookies"]["score"]["score"])
     if scores:
         overall = sum(scores) // len(scores)
         grade = "A" if overall >= 80 else "B" if overall >= 60 else "C" if overall >= 40 else "F"
@@ -134,37 +193,81 @@ def print_unified_report(url: str, final_url: str, status_code: int,
 
     print("═" * 60)
 
-    if header_findings:
-        print_header_section(header_findings)
-    if cookie_findings:
-        print_cookie_section(cookie_findings)
+    if scan.get("headers"):
+        print_header_section(scan["headers"])
+    if scan.get("cookies"):
+        print_cookie_section(scan["cookies"])
+    if show_inference:
+        vectors = infer(scan)
+        if vectors:
+            print_inference_report(url, vectors)
 
     print("\n" + "═" * 60)
     print()
 
 
-def build_json_report(url: str, final_url: str, status_code: int,
-                       header_findings: dict, cookie_findings: dict) -> dict:
-    scores = []
-    if header_findings:
-        scores.append(header_findings["score"]["score"])
-    if cookie_findings:
-        scores.append(cookie_findings["score"]["score"])
+# ─── Full Recon Mode ──────────────────────────────────────────────────────────
 
-    overall = sum(scores) // len(scores) if scores else 0
-    grade = "A" if overall >= 80 else "B" if overall >= 60 else "C" if overall >= 40 else "F"
+def full_recon(domain: str, timeout: int = 10, threads: int = 20,
+               run_inference: bool = True) -> dict:
+    domain = extract_domain(domain) if ("/" in domain or domain.startswith("http")) else domain
+
+    print(f"\n  🛡️  FULL RECON MODE  ·  {domain}")
+    print("═" * 60)
+
+    # Step 1: Subdomain enumeration
+    enum_results = enumerate_subdomains(domain, timeout=timeout, threads=threads)
+    print_enum_report(enum_results)
+
+    if enum_results["live"] == 0:
+        print("  No live subdomains found — scanning base domain only.")
+        targets = [{"subdomain": domain, "url": f"https://{domain}", "live": True}]
+    else:
+        targets = enum_results["subdomains"]
+
+    # Step 2: Scan each live target
+    print(f"\n  🔍 Scanning {len(targets)} live targets...")
+    print("═" * 60)
+
+    scanned = []
+    for target in targets:
+        url = target.get("url") or f"https://{target['subdomain']}"
+        subdomain = target.get("subdomain", domain)
+        print(f"\n  → {subdomain}")
+
+        scan = scan_target(url, run_headers=True, run_cookies=True, timeout=timeout)
+        scan["subdomain"] = subdomain
+        scan["subdomain_meta"] = target
+
+        if scan.get("error"):
+            print(f"     ⚠  {scan['error']}")
+        else:
+            h_score = scan["headers"]["score"]["score"] if scan.get("headers") else "?"
+            c_score = scan["cookies"]["score"]["score"] if scan.get("cookies") else "?"
+            print(f"     Headers: {h_score}/100  Cookies: {c_score}/100")
+
+        scanned.append(scan)
+
+    # Step 3: Attack inference
+    bulk_results = []
+    if run_inference:
+        bulk_input = [
+            {"url": s["url"], "findings": s}
+            for s in scanned if not s.get("error")
+        ]
+        bulk_results = infer_bulk(bulk_input)
+        print_bulk_report(bulk_results)
 
     return {
         "meta": {
-            "url": url,
-            "resolved_url": final_url,
-            "status_code": status_code,
+            "domain": domain,
             "timestamp": datetime.now().isoformat(),
-            "tool": "SecurityRecon v1.0",
+            "tool": "SecurityRecon v2.0 full-recon",
+            "targets_scanned": len(scanned),
         },
-        "overall_score": {"score": overall, "grade": grade},
-        "headers": header_findings,
-        "cookies": cookie_findings,
+        "subdomain_enum": enum_results,
+        "scans": scanned,
+        "bulk_inference": bulk_results,
     }
 
 
@@ -172,83 +275,98 @@ def build_json_report(url: str, final_url: str, status_code: int,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="🛡️  Security Recon Tool — Headers + Cookies",
+        description="🛡️  Security Recon Tool — Headers + Cookies + Subdomains + Attack Inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python main.py https://example.com
+  python main.py example.com --full-recon
   python main.py https://example.com --json report.json
   python main.py https://example.com --headers-only
   python main.py https://example.com --cookies-only
+  python main.py example.com --full-recon --json recon.json --threads 30
   python main.py https://example.com --quiet
         """
     )
-    parser.add_argument("url", help="Target URL to scan")
-    parser.add_argument("--json", metavar="FILE", help="Save full JSON report to file")
-    parser.add_argument("--timeout", type=int, default=10, help="Request timeout in seconds (default: 10)")
-    parser.add_argument("--headers-only", action="store_true", help="Run header analysis only")
-    parser.add_argument("--cookies-only", action="store_true", help="Run cookie analysis only")
-    parser.add_argument("--quiet", action="store_true", help="Print overall score only")
+    parser.add_argument("target", help="URL (single scan) or domain (full-recon)")
+    parser.add_argument("--full-recon", action="store_true",
+                        help="Enumerate subdomains, scan all, run attack inference")
+    parser.add_argument("--json", metavar="FILE", help="Save JSON report to file")
+    parser.add_argument("--timeout", type=int, default=10,
+                        help="Request timeout per target in seconds (default: 10)")
+    parser.add_argument("--threads", type=int, default=20,
+                        help="Threads for subdomain probing (default: 20)")
+    parser.add_argument("--headers-only", action="store_true",
+                        help="Headers only (single URL mode)")
+    parser.add_argument("--cookies-only", action="store_true",
+                        help="Cookies only (single URL mode)")
+    parser.add_argument("--no-inference", action="store_true",
+                        help="Skip attack inference")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Score summary only")
 
     args = parser.parse_args()
 
+    # ── Full Recon ────────────────────────────────────────────────────────────
+    if args.full_recon:
+        domain = extract_domain(args.target) if args.target.startswith("http") else args.target
+        result = full_recon(domain, timeout=args.timeout, threads=args.threads,
+                            run_inference=not args.no_inference)
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump(result, f, indent=2, default=str)
+            print(f"\n  📄 Full recon JSON saved: {args.json}")
+        return
+
+    # ── Single URL ────────────────────────────────────────────────────────────
     run_headers = not args.cookies_only
     run_cookies = not args.headers_only
 
-    print(f"\n  🛡️  Scanning: {args.url}")
-    if run_headers:
-        print("     → Headers")
-    if run_cookies:
-        print("     → Cookies")
+    print(f"\n  🛡️  Scanning: {args.target}")
+    scan = scan_target(args.target, run_headers=run_headers,
+                       run_cookies=run_cookies, timeout=args.timeout)
 
-    header_findings = None
-    cookie_findings = None
-    final_url = args.url
-    status_code = None
-
-    try:
-        # Headers module
-        if run_headers:
-            print("\n  Fetching headers...")
-            raw_headers, final_url, status_code = fetch_headers(args.url, args.timeout)
-            header_findings = analyze_headers(raw_headers)
-
-        # Cookies module — reuse same connection if possible
-        if run_cookies:
-            if not run_headers:
-                print("\n  Fetching cookies...")
-            cookie_headers, final_url, status_code = get_set_cookie_headers(args.url, args.timeout)
-            cookie_findings = analyze_cookies(cookie_headers)
-
-        # Output
-        if args.quiet:
-            scores = []
-            if header_findings:
-                scores.append(header_findings["score"]["score"])
-            if cookie_findings:
-                scores.append(cookie_findings["score"]["score"])
-            if scores:
-                overall = sum(scores) // len(scores)
-                grade = "A" if overall >= 80 else "B" if overall >= 60 else "C" if overall >= 40 else "F"
-                print(f"\n  Overall Score: {overall}/100  Grade: {grade}\n")
-        else:
-            print_unified_report(args.url, final_url, status_code, header_findings, cookie_findings)
-
-        if args.json:
-            report = build_json_report(args.url, final_url, status_code, header_findings, cookie_findings)
-            with open(args.json, "w") as f:
-                json.dump(report, f, indent=2)
-            print(f"  📄 JSON report saved: {args.json}")
-
-    except requests.exceptions.ConnectionError:
-        print(f"\n  ❌ Could not connect to {args.url}")
+    if scan.get("error"):
+        print(f"\n  ❌ {scan['error']}")
         sys.exit(1)
-    except requests.exceptions.Timeout:
-        print(f"\n  ❌ Request timed out after {args.timeout}s")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n  ❌ Unexpected error: {e}")
-        sys.exit(1)
+
+    if args.quiet:
+        scores = []
+        if scan.get("headers"):
+            scores.append(scan["headers"]["score"]["score"])
+        if scan.get("cookies"):
+            scores.append(scan["cookies"]["score"]["score"])
+        if scores:
+            overall = sum(scores) // len(scores)
+            grade = "A" if overall >= 80 else "B" if overall >= 60 else "C" if overall >= 40 else "F"
+            print(f"\n  Overall Score: {overall}/100  Grade: {grade}\n")
+        return
+
+    print_single_report(scan, show_inference=not args.no_inference)
+
+    if args.json:
+        scores = []
+        if scan.get("headers"):
+            scores.append(scan["headers"]["score"]["score"])
+        if scan.get("cookies"):
+            scores.append(scan["cookies"]["score"]["score"])
+        overall = sum(scores) // max(1, len(scores))
+        report = {
+            "meta": {
+                "url": args.target,
+                "resolved_url": scan.get("final_url"),
+                "status_code": scan.get("status_code"),
+                "timestamp": datetime.now().isoformat(),
+                "tool": "SecurityRecon v2.0",
+            },
+            "overall_score": {"score": overall},
+            "headers": scan.get("headers"),
+            "cookies": scan.get("cookies"),
+            "attack_vectors": infer(scan) if not args.no_inference else [],
+        }
+        with open(args.json, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"  📄 JSON report saved: {args.json}")
 
 
 if __name__ == "__main__":

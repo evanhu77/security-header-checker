@@ -94,10 +94,26 @@ def analyze_headers(raw_headers: dict) -> dict:
     leaking = []
     warnings = []
 
+    # Extract CSP value once — used for cross-header logic below
+    csp_value = headers_lower.get("content-security-policy", "")
+
     # Check for missing security headers
     for header, info in SECURITY_HEADERS.items():
         header_lower = header.lower()
         if header_lower not in headers_lower:
+
+            # X-Frame-Options: skip penalty if CSP contains frame-ancestors.
+            # frame-ancestors is the modern CSP equivalent and supersedes
+            # X-Frame-Options in all browsers that support CSP Level 2+.
+            if header == "X-Frame-Options" and "frame-ancestors" in csp_value:
+                present.append({
+                    "header": header,
+                    "value": "Covered by CSP frame-ancestors directive",
+                    "severity": info["severity"],
+                    "note": "Clickjacking protection provided via Content-Security-Policy frame-ancestors",
+                })
+                continue
+
             missing.append({
                 "header": header,
                 "severity": info["severity"],
@@ -119,7 +135,23 @@ def analyze_headers(raw_headers: dict) -> dict:
                     finding["warning"] = f"max-age={max_age} is less than recommended 31536000 (1 year)"
                     warnings.append(finding)
             if header == "Content-Security-Policy" and "unsafe-inline" in value:
-                finding["warning"] = "'unsafe-inline' weakens CSP protection against XSS"
+                # Only warn if unsafe-inline is in script-src context, not just style-src-attr
+                # style-src-attr unsafe-inline is less dangerous than script-src unsafe-inline
+                csp_lower = value.lower()
+                script_src_unsafe = (
+                    ("script-src" in csp_lower and "'unsafe-inline'" in csp_lower)
+                    and "nonce-" not in csp_lower  # nonce neutralizes unsafe-inline for scripts
+                )
+                style_attr_only = (
+                    "style-src-attr 'unsafe-inline'" in value
+                    and "script-src" not in csp_lower.split("style-src-attr")[0].split("script-src")[-1]
+                )
+                if script_src_unsafe:
+                    finding["warning"] = "'unsafe-inline' in script-src critically weakens XSS protection"
+                elif style_attr_only:
+                    finding["warning"] = "'unsafe-inline' in style-src-attr allows CSS injection (lower risk than script unsafe-inline)"
+                else:
+                    finding["warning"] = "'unsafe-inline' present — review which directives are affected"
                 warnings.append(finding)
             present.append(finding)
 

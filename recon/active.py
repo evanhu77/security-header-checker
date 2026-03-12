@@ -11,6 +11,7 @@ import time
 from urllib.parse import urlparse, urljoin, parse_qs, urlunparse
 from bs4 import BeautifulSoup
 from rich.console import Console
+from recon.surface_scraper import SurfaceScraper
 
 console = Console()
 
@@ -88,8 +89,8 @@ class ActiveRecon:
         return results
 
     def run_full(self, passive_results, light_results):
-        """Full active: deep crawl, parameter extraction, API fuzzing"""
-        results = {"entry_points": [], "crawled_urls": [], "parameters": [], "api_endpoints": []}
+        """Full active: deep crawl, parameter extraction, API fuzzing, surface scrape"""
+        results = {"entry_points": [], "crawled_urls": [], "parameters": [], "api_endpoints": [], "surface": {}}
 
         # Seed with discovered URLs
         seed_urls = [self.base_url]
@@ -111,6 +112,86 @@ class ActiveRecon:
                     time.sleep(0.5)
                 except Exception as e:
                     console.print(f"[yellow]⚠[/yellow] {desc} failed: {e}")
+
+        # Surface scrape against every crawled URL
+        with console.status("[cyan]Scraping attack surfaces (forms, JS, CORS)...[/cyan]"):
+            try:
+                scrape_urls = list(set(results.get("crawled_urls", []) + [self.base_url]))
+                scraper = SurfaceScraper(self.base_url, self.domain, session=self.session)
+                surface = scraper.scrape_all(scrape_urls)
+                results["surface"] = surface
+
+                # Promote CORS findings — deduplicated by URL
+                existing_cors_urls = {ep["url"] for ep in self.entry_points if ep["type"] == "cors_misconfiguration"}
+                for cors in surface.get("cors", []):
+                    if cors["url"] not in existing_cors_urls:
+                        existing_cors_urls.add(cors["url"])
+                        self.entry_points.append({
+                            "type": "cors_misconfiguration",
+                            "url": cors["url"],
+                            "param": cors["origin_sent"],
+                            "detail": f"CORS reflects origin {cors['origin_sent']} — ACAO: {cors['acao']}, credentials: {cors['credentials'] or 'false'}",
+                            "phase": "full_active",
+                            "severity": cors["severity"],
+                            "attack_hint": "Wildcard CORS — test if authenticated endpoints leak data cross-origin. Escalates to HIGH if credentials: true"
+                        })
+
+                # Promote sensitive form field findings
+                for si in surface.get("sensitive_inputs", []):
+                    self.entry_points.append({
+                        "type": "sensitive_form_field",
+                        "url": si["action"],
+                        "param": ", ".join(si["fields"]),
+                        "detail": f"Form contains privileged field(s): {', '.join(si['fields'])}",
+                        "phase": "full_active",
+                        "severity": "HIGH",
+                        "attack_hint": "Mass assignment candidate — try submitting these fields via API to escalate privileges"
+                    })
+
+                # Promote JS-discovered API and rest endpoints, and flag open redirect pattern
+                seen_js_eps = set()
+                for ep in surface.get("js_endpoints", []):
+                    endpoint = ep["endpoint"]
+                    if endpoint in seen_js_eps:
+                        continue
+
+                    # Open redirect candidates from JS bundle
+                    if "./redirect?to=" in endpoint or "/redirect?to=" in endpoint:
+                        seen_js_eps.add(endpoint)
+                        self.entry_points.append({
+                            "type": "open_redirect",
+                            "url": urljoin(self.base_url, endpoint),
+                            "param": "to",
+                            "detail": f"Open redirect endpoint found in JS bundle: {endpoint}",
+                            "phase": "full_active",
+                            "severity": "MEDIUM",
+                            "attack_hint": "Confirm redirect is unvalidated — use for phishing, OAuth token theft"
+                        })
+                        continue
+
+                    # API and REST endpoints
+                    if endpoint.startswith("/api") or endpoint.startswith("/rest/"):
+                        seen_js_eps.add(endpoint)
+                        full_url = urljoin(self.base_url, endpoint)
+                        # Score /rest/user/* and /rest/admin higher
+                        if any(k in endpoint for k in ["admin", "login", "password", "wallet", "membership"]):
+                            severity = "HIGH"
+                            hint = "High-value REST endpoint — test auth requirements, parameter tampering"
+                        else:
+                            severity = "MEDIUM"
+                            hint = "Enumerate this endpoint — check auth requirements, test IDOR on any IDs"
+                        self.entry_points.append({
+                            "type": "js_extracted_endpoint",
+                            "url": full_url,
+                            "param": endpoint,
+                            "detail": f"API endpoint found in JS bundle: {endpoint}",
+                            "phase": "full_active",
+                            "severity": severity,
+                            "attack_hint": hint
+                        })
+
+            except Exception as e:
+                console.print(f"[yellow]⚠[/yellow] Surface scrape failed: {e}")
 
         results["entry_points"] = self.entry_points
         self._print_phase_summary("Full Active", results)
@@ -159,28 +240,48 @@ class ActiveRecon:
                 console.print(f"  [dim]{len(urls)} URLs in sitemap[/dim]")
         except Exception:
             pass
-
     def _probe_common_paths(self, results):
         """Check common sensitive paths"""
         found_paths = []
+
+        # Establish SPA baseline before probing
+        baseline_status, baseline_size = None, None
+        try:
+            baseline_resp = self.session.get(
+                urljoin(self.base_url, "/asdfjkl123qwerty_baseline_check"),
+                timeout=8,
+                allow_redirects=False
+            )
+            baseline_status = baseline_resp.status_code
+            baseline_size = len(baseline_resp.content)
+            console.print(f"  [dim]Baseline: HTTP {baseline_status}, {baseline_size} bytes[/dim]")
+        except requests.RequestException:
+            console.print(f"  [dim]Baseline check failed — SPA filtering disabled[/dim]")
 
         for path in COMMON_PATHS:
             try:
                 url = urljoin(self.base_url, path)
                 resp = self.session.get(url, timeout=8, allow_redirects=False)
-                
+
                 if resp.status_code in [200, 201, 301, 302, 403, 405]:
+                    content_size = len(resp.content)
+
+                    # Filter SPA catchalls — same status + within 500 bytes of baseline
+                    if (baseline_size is not None and
+                        resp.status_code == baseline_status and
+                        abs(content_size - baseline_size) < 500):
+                        continue  # SPA catchall, not a real finding
+
                     found_paths.append({
                         "path": path,
                         "url": url,
                         "status": resp.status_code,
-                        "size": len(resp.content)
+                        "size": content_size
                     })
 
                     severity = "LOW"
                     attack_hint = "Investigate manually"
 
-                    # Categorize findings
                     if resp.status_code == 200:
                         if any(k in path for k in [".env", "config.json", "package.json", ".git"]):
                             severity = "CRITICAL"
@@ -215,7 +316,6 @@ class ActiveRecon:
 
         results["paths_found"] = found_paths
         console.print(f"  [dim]{len(found_paths)} paths responded[/dim]")
-
     def _extract_js_endpoints(self, results):
         """Fetch homepage, find JS files, extract API endpoints from them"""
         try:
